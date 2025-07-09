@@ -3,6 +3,7 @@ import zipfile
 import io
 import xml.etree.ElementTree as ET
 import zlib
+import re
 from flask import Flask, request, jsonify
 import requests
 
@@ -12,21 +13,29 @@ SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL')
 
 def clean_xml_data(xml_bytes):
     """
-    XML 데이터에서 파싱 오류를 유발할 수 있는 유효하지 않은 제어 문자를 제거합니다.
-    (Tab, Newline, Carriage Return 제외)
+    XML 1.0 표준에 맞지 않는 모든 유효하지 않은 문자를 정규식을 사용하여 제거합니다.
+    이는 언리얼 엔진 로그에 포함될 수 있는 깨진 문자나 제어 문자를 처리하는
+    가장 확실한 방법입니다.
     """
     if not xml_bytes:
-        return xml_bytes
+        return b''
+
+    try:
+        # UTF-8로 디코딩을 시도합니다. 깨진 문자는 무시합니다.
+        xml_string = xml_bytes.decode('utf-8', errors='ignore')
+    except Exception:
+        return b'' # 디코딩 실패 시 빈 바이트 반환
+
+    # XML 1.0 명세에서 허용하는 문자 범위:
+    # #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+    # 이 범위를 벗어나는 모든 문자를 찾는 정규식입니다.
+    invalid_xml_chars_re = re.compile(u'[^\u0009\u000a\u000d\u0020-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]')
     
-    # NULL 바이트(0x00) 제거
-    cleaned_data = xml_bytes.replace(b'\x00', b'')
+    # 유효하지 않은 문자를 빈 문자열로 치환합니다.
+    cleaned_string = invalid_xml_chars_re.sub('', xml_string)
     
-    # 기타 제어 문자(0x01-0x1F) 제거 (0x09, 0x0A, 0x0D는 제외)
-    invalid_chars = [i for i in range(0x01, 0x20) if i not in [0x09, 0x0A, 0x0D]]
-    for char_code in invalid_chars:
-        cleaned_data = cleaned_data.replace(bytes([char_code]), b'')
-        
-    return cleaned_data
+    # XML 파서가 처리할 수 있도록 다시 UTF-8 바이트로 인코딩합니다.
+    return cleaned_string.encode('utf-8')
 
 @app.route('/api/crashes', methods=['POST'])
 def handle_crash_report():
@@ -56,7 +65,7 @@ def handle_crash_report():
         if not xml_data_bytes:
             return "Bad Request: No valid crash data found.", 400
 
-        # --- 2. 데이터 정제 ---
+        # --- 2. 데이터 정제 (가장 강력한 버전) ---
         cleaned_xml = clean_xml_data(xml_data_bytes)
 
         # --- 3. XML 파싱 및 정보 추출 ---
@@ -92,6 +101,6 @@ def handle_crash_report():
         return jsonify({"status": "success"}), 200
 
     except Exception as e:
-        # 오류 발생 시 Render 로그에 기록
+        # 오류 발생 시 Render 로그에 기록하여 최소한의 디버깅 정보를 남깁니다.
         print(f"[ERROR] An unexpected error occurred: {e}")
         return "Internal Server Error", 500
