@@ -42,15 +42,33 @@ def handle_crash_report():
     elif request.data:
         print(f"Log: No zip file. Processing raw request body. Headers: {request.headers}")
         
-        # --- ZLIB 압축 해제 로직 (더욱 강력하게 수정) ---
+        decompressed_data = None
         try:
             # 먼저 zlib 압축 해제를 시도합니다.
-            xml_data = zlib.decompress(request.data)
+            decompressed_data = zlib.decompress(request.data)
             print("Log: Successfully decompressed zlib-encoded body.")
         except zlib.error:
             # 만약 zlib 오류가 발생하면, 압축되지 않은 데이터로 간주하고 원본을 그대로 사용합니다.
             print("Log: Data is not zlib-compressed. Using raw body.")
-            xml_data = request.data
+            decompressed_data = request.data
+        
+        # --- 최종 수정: Unreal의 CR1 바이너리 래퍼 처리 ---
+        # 데이터가 'CR1' 시그니처로 시작하는지 확인합니다.
+        if decompressed_data.startswith(b'CR1'):
+            print("Log: 'CR1' header detected. Searching for XML payload.")
+            # '<?xml' 문자열을 찾아 실제 XML 데이터의 시작 위치를 찾습니다.
+            xml_start_index = decompressed_data.find(b'<?xml')
+            if xml_start_index != -1:
+                # XML 시작 위치부터 끝까지를 실제 데이터로 사용합니다.
+                xml_data = decompressed_data[xml_start_index:]
+                print("Log: Successfully extracted XML payload from CR1 wrapper.")
+            else:
+                print("Error: 'CR1' header found, but no XML payload could be located.")
+                xml_data = None
+        else:
+            # 'CR1' 헤더가 없으면, 전체 데이터가 XML이라고 가정합니다.
+            print("Log: No 'CR1' header. Assuming data is pure XML.")
+            xml_data = decompressed_data
         # --- 로직 끝 ---
         
     else:
