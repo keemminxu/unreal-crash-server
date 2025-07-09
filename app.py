@@ -2,7 +2,7 @@ import os
 import zipfile
 import io
 import xml.etree.ElementTree as ET
-import gzip  # Gzip 압축 해제를 위해 추가
+import zlib  # gzip 대신 zlib 라이브러리를 사용합니다.
 from flask import Flask, request, jsonify
 import requests
 
@@ -42,19 +42,16 @@ def handle_crash_report():
     elif request.data:
         print(f"Log: No zip file. Processing raw request body. Headers: {request.headers}")
         
-        # --- GZIP 압축 해제 로직 시작 ---
-        # Content-Encoding 헤더를 확인하여 Gzip 압축 여부를 판단합니다.
-        if request.headers.get('Content-Encoding') == 'gzip':
-            print("Log: Decompressing gzip-encoded body.")
-            try:
-                xml_data = gzip.decompress(request.data)
-            except gzip.BadGzipFile:
-                print("Error: Bad Gzip data received in body.")
-                return "Bad Request: Invalid gzip data", 400
-        else:
-            # 압축되지 않은 경우, 데이터를 그대로 사용합니다.
+        # --- ZLIB 압축 해제 로직 (더욱 강력하게 수정) ---
+        try:
+            # 먼저 zlib 압축 해제를 시도합니다.
+            xml_data = zlib.decompress(request.data)
+            print("Log: Successfully decompressed zlib-encoded body.")
+        except zlib.error:
+            # 만약 zlib 오류가 발생하면, 압축되지 않은 데이터로 간주하고 원본을 그대로 사용합니다.
+            print("Log: Data is not zlib-compressed. Using raw body.")
             xml_data = request.data
-        # --- GZIP 압축 해제 로직 끝 ---
+        # --- 로직 끝 ---
         
     else:
         print("Error: Neither 'CrashReport.zip' nor raw body data found.")
@@ -108,10 +105,8 @@ def handle_crash_report():
 
     except ET.ParseError as e:
         print(f"Error: XML Parse Error - {e}. Data received might not be valid XML.")
-        # 디버깅을 위해 수신된 데이터의 일부를 출력합니다.
         print(f"Received data (first 200 bytes): {xml_data[:200]}")
         return "Bad Request: Invalid XML format.", 400
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
         return "Internal Server Error", 500
-
