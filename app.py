@@ -38,7 +38,7 @@ def send_slack_error_report(error_title, error_details, raw_data=""):
         slack_message["blocks"].append({"type": "divider"})
         slack_message["blocks"].append({
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Received Data (first 500 bytes):*\n```{raw_data[:500]}```"}
+            "text": {"type": "mrkdwn", "text": f"*Received Data (first 1000 bytes):*\n```{raw_data[:1000]}```"}
         })
     
     try:
@@ -106,9 +106,14 @@ def handle_crash_report():
         print("Error: Could not extract XML data from the report.")
         return "Bad Request: XML context file not found in the report.", 400
 
+    # --- 최종 수정: XML 파싱 전 데이터 정제(Cleaning) ---
+    # XML 데이터에서 파싱 오류를 유발할 수 있는 NULL 바이트(0x00)를 제거합니다.
+    # 언리얼 엔진 로그에는 종종 이 문자가 포함될 수 있습니다.
+    cleaned_xml_data = xml_data_bytes.replace(b'\x00', b'')
+
     try:
-        # XML 파싱 시도
-        root = ET.fromstring(xml_data_bytes)
+        # 정제된 데이터로 XML 파싱 시도
+        root = ET.fromstring(cleaned_xml_data)
         error_message = getattr(root.find('.//ErrorMessage'), 'text', 'N/A')
         call_stack_nodes = root.findall('.//CallStack/Source')
         call_stack = "\n".join([node.text[:200] for node in call_stack_nodes[:10]]) if call_stack_nodes else "N/A"
@@ -150,16 +155,14 @@ def handle_crash_report():
         return jsonify({"status": "success"}), 200
 
     except ET.ParseError as e:
-        # --- 최종 수정: XML 파싱 실패 시, 오류 내용을 슬랙으로 보냄 ---
         error_str = str(e)
         print(f"Error: XML Parse Error - {error_str}. Sending raw data to Slack for inspection.")
         
-        # 수신된 데이터를 문자열로 변환 (오류 무시)
-        raw_data_str = xml_data_bytes.decode('utf-8', errors='ignore')
+        # 정제된 데이터를 문자열로 변환 (오류 무시)
+        raw_data_str = cleaned_xml_data.decode('utf-8', errors='ignore')
         
         send_slack_error_report("XML Parse Error", error_str, raw_data_str)
         
-        # 클라이언트에는 Bad Request 응답
         return "Bad Request: Invalid XML format.", 400
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
