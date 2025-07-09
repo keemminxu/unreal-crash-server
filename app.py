@@ -12,6 +12,41 @@ app = Flask(__name__)
 # Render 환경 변수에서 슬랙 웹훅 URL을 가져옵니다.
 SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL')
 
+def send_slack_error_report(error_title, error_details, raw_data=""):
+    """파싱 실패 등 내부 오류 발생 시 슬랙으로 알림을 보냅니다."""
+    if not SLACK_WEBHOOK_URL:
+        return
+
+    slack_message = {
+        "blocks": [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": f":x: Crash Reporter Server Error!", "emoji": True}
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*Error Type:*\n{error_title}"}
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*Details:*\n```{error_details}```"}
+            }
+        ]
+    }
+    if raw_data:
+        # 수신된 데이터의 일부를 추가로 보여줍니다.
+        slack_message["blocks"].append({"type": "divider"})
+        slack_message["blocks"].append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Received Data (first 500 bytes):*\n```{raw_data[:500]}```"}
+        })
+    
+    try:
+        requests.post(SLACK_WEBHOOK_URL, json=slack_message)
+    except Exception as e:
+        print(f"Failed to send error report to slack: {e}")
+
+
 @app.route('/api/crashes', methods=['POST'])
 def handle_crash_report():
     """언리얼 엔진 크래시 리포터로부터 POST 요청을 받아 처리합니다."""
@@ -19,7 +54,7 @@ def handle_crash_report():
         print("Error: SLACK_WEBHOOK_URL is not set in environment variables.")
         return "Internal server configuration error", 500
 
-    xml_data = None
+    xml_data_bytes = None
     report_type = "Log" # 기본값은 로그
 
     # 1. Zip 파일이 있는지 먼저 확인 (하드 크래시의 경우)
@@ -31,11 +66,11 @@ def handle_crash_report():
             with zipfile.ZipFile(io.BytesIO(zip_file_storage.read())) as thezip:
                 for filename in thezip.namelist():
                     if 'CrashContext.runtime-xml' in filename:
-                        xml_data = thezip.read(filename)
+                        xml_data_bytes = thezip.read(filename)
                         print(f"Log: Found and read '{filename}' from zip.")
                         break
-        except zipfile.BadZipFile:
-            print("Error: The uploaded file is not a valid zip file.")
+        except zipfile.BadZipFile as e:
+            print(f"Error: {e}")
             return "Bad Request: Invalid zip file format.", 400
 
     # 2. Zip 파일이 없다면, 요청의 본문에 데이터가 있는지 확인 (로그 전송의 경우)
@@ -44,43 +79,36 @@ def handle_crash_report():
         
         decompressed_data = None
         try:
-            # 먼저 zlib 압축 해제를 시도합니다.
             decompressed_data = zlib.decompress(request.data)
             print("Log: Successfully decompressed zlib-encoded body.")
         except zlib.error:
-            # 만약 zlib 오류가 발생하면, 압축되지 않은 데이터로 간주하고 원본을 그대로 사용합니다.
             print("Log: Data is not zlib-compressed. Using raw body.")
             decompressed_data = request.data
         
-        # --- 최종 수정: Unreal의 CR1 바이너리 래퍼 처리 ---
-        # 데이터가 'CR1' 시그니처로 시작하는지 확인합니다.
         if decompressed_data.startswith(b'CR1'):
             print("Log: 'CR1' header detected. Searching for XML payload.")
-            # '<?xml' 문자열을 찾아 실제 XML 데이터의 시작 위치를 찾습니다.
             xml_start_index = decompressed_data.find(b'<?xml')
             if xml_start_index != -1:
-                # XML 시작 위치부터 끝까지를 실제 데이터로 사용합니다.
-                xml_data = decompressed_data[xml_start_index:]
+                xml_data_bytes = decompressed_data[xml_start_index:]
                 print("Log: Successfully extracted XML payload from CR1 wrapper.")
             else:
                 print("Error: 'CR1' header found, but no XML payload could be located.")
-                xml_data = None
+                xml_data_bytes = None
         else:
-            # 'CR1' 헤더가 없으면, 전체 데이터가 XML이라고 가정합니다.
             print("Log: No 'CR1' header. Assuming data is pure XML.")
-            xml_data = decompressed_data
-        # --- 로직 끝 ---
+            xml_data_bytes = decompressed_data
         
     else:
         print("Error: Neither 'CrashReport.zip' nor raw body data found.")
         return "Bad Request: No crash data provided.", 400
 
-    if not xml_data:
+    if not xml_data_bytes:
         print("Error: Could not extract XML data from the report.")
         return "Bad Request: XML context file not found in the report.", 400
 
     try:
-        root = ET.fromstring(xml_data)
+        # XML 파싱 시도
+        root = ET.fromstring(xml_data_bytes)
         error_message = getattr(root.find('.//ErrorMessage'), 'text', 'N/A')
         call_stack_nodes = root.findall('.//CallStack/Source')
         call_stack = "\n".join([node.text[:200] for node in call_stack_nodes[:10]]) if call_stack_nodes else "N/A"
@@ -122,9 +150,18 @@ def handle_crash_report():
         return jsonify({"status": "success"}), 200
 
     except ET.ParseError as e:
-        print(f"Error: XML Parse Error - {e}. Data received might not be valid XML.")
-        print(f"Received data (first 200 bytes): {xml_data[:200]}")
+        # --- 최종 수정: XML 파싱 실패 시, 오류 내용을 슬랙으로 보냄 ---
+        error_str = str(e)
+        print(f"Error: XML Parse Error - {error_str}. Sending raw data to Slack for inspection.")
+        
+        # 수신된 데이터를 문자열로 변환 (오류 무시)
+        raw_data_str = xml_data_bytes.decode('utf-8', errors='ignore')
+        
+        send_slack_error_report("XML Parse Error", error_str, raw_data_str)
+        
+        # 클라이언트에는 Bad Request 응답
         return "Bad Request: Invalid XML format.", 400
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
+        send_slack_error_report("An unexpected server error occurred", str(e))
         return "Internal Server Error", 500
