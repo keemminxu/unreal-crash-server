@@ -11,96 +11,116 @@ import requests
 app = Flask(__name__)
 SLACK_WEBHOOK_URL = os.environ.get('SLACK_WEBHOOK_URL')
 
-def clean_xml_data(xml_bytes):
+def clean_xml_string(xml_string):
     """
     XML 1.0 표준에 맞지 않는 모든 유효하지 않은 문자를 정규식을 사용하여 제거합니다.
-    이는 언리얼 엔진 로그에 포함될 수 있는 깨진 문자나 제어 문자를 처리하는
-    가장 확실한 방법입니다.
     """
-    if not xml_bytes:
-        return b''
-
-    try:
-        # UTF-8로 디코딩을 시도합니다. 깨진 문자는 무시합니다.
-        xml_string = xml_bytes.decode('utf-8', errors='ignore')
-    except Exception:
-        return b'' # 디코딩 실패 시 빈 바이트 반환
-
-    # XML 1.0 명세에서 허용하는 문자 범위:
-    # #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
-    # 이 범위를 벗어나는 모든 문자를 찾는 정규식입니다.
+    if not xml_string:
+        return ""
+    # XML 1.0 명세에서 허용하는 문자 범위를 벗어나는 모든 문자를 찾는 정규식
     invalid_xml_chars_re = re.compile(u'[^\u0009\u000a\u000d\u0020-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]')
-    
-    # 유효하지 않은 문자를 빈 문자열로 치환합니다.
-    cleaned_string = invalid_xml_chars_re.sub('', xml_string)
-    
-    # XML 파서가 처리할 수 있도록 다시 UTF-8 바이트로 인코딩합니다.
-    return cleaned_string.encode('utf-8')
+    return invalid_xml_chars_re.sub('', xml_string)
 
 @app.route('/api/crashes', methods=['POST'])
 def handle_crash_report():
-    """언리얼 엔진 크래시 리포트를 수신하여 슬랙으로 전송합니다."""
-    try:
-        # --- 1. 데이터 추출 ---
-        xml_data_bytes = None
-        report_type = "Log"
+    """
+    크래시 리포트를 받아, 파싱 성공 여부와 관계없이 최대한의 정보를 슬랙으로 전송합니다.
+    """
+    # --- 1. URL과 헤더에서 기본 정보 추출 ---
+    app_version = request.args.get('AppVersion', 'N/A')
+    build_environment = request.args.get('AppEnvironment', 'N/A')
+    # URL의 UserID는 EpicAccountID|MachineId|SessionId 형식이므로 첫 부분을 사용
+    user_id_from_url = request.args.get('UserID', 'N/A').split('|')[0]
+    country = request.headers.get('Cf-Ipcountry', 'N/A')
 
+    # 슬랙 메시지에 사용할 변수들 기본값 설정
+    final_user_id = user_id_from_url
+    error_message = "XML 데이터 없음"
+    call_stack = "XML 데이터 없음"
+    report_type = "Log"
+
+    try:
+        # --- 2. 본문에서 데이터 추출 및 압축 해제 ---
+        raw_data = None
         if 'CrashReport.zip' in request.files:
             report_type = "Crash"
             zip_file = request.files['CrashReport.zip']
             with zipfile.ZipFile(io.BytesIO(zip_file.read())) as thezip:
                 for filename in thezip.namelist():
                     if 'CrashContext.runtime-xml' in filename:
-                        xml_data_bytes = thezip.read(filename)
+                        raw_data = thezip.read(filename)
                         break
         elif request.data:
-            decompressed_data = zlib.decompress(request.data)
-            if decompressed_data.startswith(b'CR1'):
-                xml_start_index = decompressed_data.find(b'<?xml')
-                if xml_start_index != -1:
-                    xml_data_bytes = decompressed_data[xml_start_index:]
-            else:
-                xml_data_bytes = decompressed_data
+            raw_data = zlib.decompress(request.data)
         
-        if not xml_data_bytes:
-            return "Bad Request: No valid crash data found.", 400
+        if raw_data:
+            # --- 3. XML 문서만 정확히 잘라내기 ---
+            xml_content = None
+            search_start_index = raw_data.find(b'CR1') if raw_data.startswith(b'CR1') else 0
+            xml_start_index = raw_data.find(b'<?xml', search_start_index)
+            if xml_start_index != -1:
+                closing_tag = b'</FGenericCrashContext>'
+                xml_end_index = raw_data.find(closing_tag, xml_start_index)
+                if xml_end_index != -1:
+                    end_of_slice = xml_end_index + len(closing_tag)
+                    xml_content = raw_data[xml_start_index:end_of_slice]
 
-        # --- 2. 데이터 정제 (가장 강력한 버전) ---
-        cleaned_xml = clean_xml_data(xml_data_bytes)
-
-        # --- 3. XML 파싱 및 정보 추출 ---
-        root = ET.fromstring(cleaned_xml)
-        
-        error_message = getattr(root.find('.//ErrorMessage'), 'text', 'N/A')
-        call_stack_nodes = root.findall('.//CallStack/Source')
-        call_stack = "\n".join([node.text[:200] for node in call_stack_nodes[:10]]) if call_stack_nodes else "N/A"
-        engine_version = getattr(root.find('.//BuildVersion'), 'text', 'N/A')
-        user_name = getattr(root.find('.//UserName'), 'text', 'N/A')
-        platform = getattr(root.find('.//PlatformFullName'), 'text', 'N/A')
-        build_config = getattr(root.find('.//BuildConfiguration'), 'text', 'N/A')
-        
-        # --- 4. 슬랙 메시지 생성 및 전송 ---
-        icon = ":boom:" if report_type == "Crash" else ":warning:"
-        slack_message = {
-            "blocks": [
-                {"type": "header", "text": {"type": "plain_text", "text": f"{icon} Unreal Engine {report_type} Report! ({build_config})", "emoji": True}},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Message:*\n```{error_message}```"}},
-                {"type": "section", "fields": [
-                    {"type": "mrkdwn", "text": f"*Platform:*\n{platform}"},
-                    {"type": "mrkdwn", "text": f"*User:*\n{user_name}"},
-                    {"type": "mrkdwn", "text": f"*Engine Version:*\n{engine_version}"}
-                ]},
-                {"type": "divider"},
-                {"type": "section", "text": {"type": "mrkdwn", "text": f"*Call Stack (Top 10):*\n```{call_stack}```"}}
-            ]
-        }
-
-        requests.post(SLACK_WEBHOOK_URL, json=slack_message, timeout=10).raise_for_status()
-        
-        print(f"Successfully processed and sent a {report_type} report to Slack.")
-        return jsonify({"status": "success"}), 200
+            if xml_content:
+                cleaned_xml_string = clean_xml_string(xml_content.decode('utf-8', errors='ignore'))
+                
+                # --- 4. XML 파싱 및 상세 정보 추출 ---
+                root = ET.fromstring(cleaned_xml_string)
+                
+                # XML에서 더 정확한 정보가 있으면 덮어쓰기
+                app_version = getattr(root.find('.//EngineVersion'), 'text', app_version)
+                build_environment = getattr(root.find('.//BuildConfiguration'), 'text', build_environment)
+                final_user_id = getattr(root.find('.//EpicAccountId'), 'text', user_id_from_url) # XML의 EpicAccountId 우선
+                
+                error_message = getattr(root.find('.//ErrorMessage'), 'text', '태그 없음')
+                
+                # CallStack 추출 방식 수정: find로 단일 노드를 찾고, text를 가져옵니다.
+                call_stack_node = root.find('.//CallStack')
+                if call_stack_node is not None and call_stack_node.text:
+                    # 콜스택을 줄바꿈으로 나누고 상위 10개만 선택
+                    call_stack_lines = call_stack_node.text.strip().split('\n')
+                    call_stack = "\n".join(call_stack_lines[:10])
+                else:
+                    call_stack = "콜스택 없음"
 
     except Exception as e:
-        # 오류 발생 시 Render 로그에 기록하여 최소한의 디버깅 정보를 남깁니다.
-        print(f"[ERROR] An unexpected error occurred: {e}")
-        return "Internal Server Error", 500
+        # 어떤 단계에서든 오류가 발생하면, 오류 정보를 기록
+        error_message = "서버 처리 중 오류 발생"
+        call_stack = str(e)
+        print(f"[ERROR] An unexpected error occurred during data processing: {e}")
+
+    # --- 5. 최종 정보 취합 및 슬랙 전송 ---
+    icon = ":boom:" if report_type == "Crash" else ":warning:"
+    
+    slack_message = {
+        "blocks": [
+            {"type": "header", "text": {"type": "plain_text", "text": f"{icon} Unreal Engine Report Received!", "emoji": True}},
+            {"type": "section", "fields": [
+                {"type": "mrkdwn", "text": f"*App Version:*\n{app_version}"},
+                {"type": "mrkdwn", "text": f"*Build Env:*\n{build_environment}"},
+                {"type": "mrkdwn", "text": f"*User ID:*\n{final_user_id}"},
+                {"type": "mrkdwn", "text": f"*Country:*\n{country}"}
+            ]},
+            {"type": "divider"},
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*Error Message:*\n```{error_message}```"}
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*Call Stack:*\n```{call_stack}```"}
+            }
+        ]
+    }
+
+    try:
+        requests.post(SLACK_WEBHOOK_URL, json=slack_message, timeout=10).raise_for_status()
+        print("Successfully sent a report to Slack.")
+    except Exception as e:
+        print(f"[ERROR] Failed to send final report to Slack: {e}")
+
+    return jsonify({"status": "processed"}), 200
